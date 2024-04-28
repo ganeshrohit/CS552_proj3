@@ -33,6 +33,14 @@ struct parser_pos {
 };
 
 
+
+struct network_xor {
+    char filled[8]; // either 0 or "RESULT"
+    __u32 first;    // first operand, will also hold the result eventually
+    __u32 second;   // second operand
+} __attribute__((packed));
+
+
 struct token_params {
     __u64 last_refill_time;
     __u64 no_of_tokens;
@@ -397,3 +405,27 @@ enum xdp_action {
         XDP_REDIRECT,
 };
 */
+
+
+/* XOR function */
+static __always_inline void xor_operation(struct network_xor *xor_header) {
+    xor_header->first = xor_header->first ^ xor_header->second;
+    // Fill the 'filled' field with the string "RESULT"
+    bpf_snprintf(xor_header->filled, sizeof(xor_header->filled), "RESULT");
+}
+
+/* XDP program for performing the XOR operation */
+SEC("xdp")
+int xdp_xor_func(struct xdp_md *ctx) {
+    void *data = (void *)(long)ctx->data;
+    void *data_end = (void *)(long)ctx->data_end;
+    
+    if (data + sizeof(struct network_xor) > data_end)
+        return XDP_DROP;
+
+    struct network_xor *xor_header = data;
+
+    xor_operation(xor_header);
+
+    return XDP_TX;
+}
