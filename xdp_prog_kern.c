@@ -11,6 +11,9 @@
 #include <linux/icmp.h>
 #include <bpf/bpf_endian.h>
 #include <linux/in.h>
+#include "tokens.h"
+
+#define NSEC_PER_SEC 1000000000
 
 /* Notice how this XDP/BPF-program contains several programs in the same source
  * file. These will each get their own section in the ELF file, and via libbpf
@@ -31,8 +34,8 @@ struct parser_pos {
 
 
 struct token_params {
-    u64 last_refill_time;
-    u64 no_of_tokens;
+    __u64 last_refill_time;
+    __u64 no_of_tokens;
 };
 
 struct {
@@ -183,9 +186,54 @@ static __always_inline int parse_icmp6_hdr(struct parser_pos *parse_pos,
 
 
 
-static __always_inline int xdp_token_policer(__u16 port) {
+static __always_inline int token_policer(__u16 * dport) {
     // to be done
-    return XDP_PASS;
+
+    bpf_printk("in token func, port no: %d\n", *dport);
+    // Lookup token bucket state from map
+    struct token_params *bucket_state = bpf_map_lookup_elem(&token_map, dport);
+
+    // Apply token bucket policy
+    if (bucket_state) {
+        bpf_printk("inside the if key exists area\n");
+        // Existing flow - calculate refills and update state
+        __u64 current_time = bpf_ktime_get_ns();
+        bpf_printk("current time %llu \n", current_time);
+        __u64 delta_ns = current_time - bucket_state->last_refill_time;
+        __u64 delta_ns_in_sec = delta_ns / NSEC_PER_SEC;
+        __u64 num_refills = delta_ns_in_sec * TOKEN_RATE_PPS;
+
+        bpf_printk("refill values: %llu and time: %llu\n", num_refills, delta_ns_in_sec);
+        bpf_printk("prev time: %llu, current time: %llu\n", bucket_state->last_refill_time, current_time);
+        bpf_printk("no of tokens before : %llu \n", bucket_state->no_of_tokens);
+        // Update token count considering refills and potential packet transmission
+        // bucket_state->no_of_tokens = bpf_min(bucket_state->no_of_tokens + num_refills, MAX_TOKENS);
+        bucket_state->no_of_tokens = (bucket_state->no_of_tokens + num_refills) < MAX_TOKENS ?
+                                     (bucket_state->no_of_tokens + num_refills) : MAX_TOKENS;
+        
+        bpf_printk("no of tokens after refill: %llu \n", bucket_state->no_of_tokens);
+        // bucket_state->last_refill_time = current_time;
+
+        if (bucket_state->no_of_tokens > 0) {
+            bucket_state->no_of_tokens--;
+            bucket_state->last_refill_time = current_time;
+            return XDP_TX; // Allow packet
+        } 
+        else {
+            return XDP_DROP; // Drop packet if not enough tokens
+        }
+    } 
+    else {
+        bpf_printk("inside the else area\n");
+        bpf_printk("max tokens: %u \n", MAX_TOKENS);
+        // New flow - allow first packet and initialize state
+        struct token_params new_state = {bpf_ktime_get_ns(), MAX_TOKENS-1};
+        bpf_printk("no of tokens: %llu, current time: %llu \n", new_state.no_of_tokens, new_state.last_refill_time);
+        bpf_map_update_elem(&token_map, dport, &new_state, BPF_ANY);
+        return XDP_TX; // Allow first packet
+    }
+
+    // return XDP_PASS;
 }
 
 
@@ -193,6 +241,7 @@ static __always_inline int xdp_token_policer(__u16 port) {
 SEC("xdp")
 int  xdp_pass_func(struct xdp_md *ctx)
 {
+    bpf_printk("in the first func");
 	void *data = (void *)(long)ctx->data;
 	void *data_end = (void *)(long)ctx->data_end;
     int action = XDP_PASS;
@@ -210,6 +259,7 @@ int  xdp_pass_func(struct xdp_md *ctx)
 	// int nexthead_type;
 	int eth_type, ip_type;
 	parse_pos.pos = data;
+    __u16 dport;
 
 	/* ethernet header*/
 	eth_type = parse_eth_hdr(&parse_pos, data_end, &eth_hdr);
@@ -218,6 +268,8 @@ int  xdp_pass_func(struct xdp_md *ctx)
 		action = XDP_ABORTED;
 		goto out;
 	}
+
+    bpf_printk("after parsing eth");
 
 	/* ip headers*/
 	if(eth_type == bpf_htons(ETH_P_IP)) {
@@ -228,10 +280,17 @@ int  xdp_pass_func(struct xdp_md *ctx)
             goto out;
         }
 
+        bpf_printk("after parsing ip4");
+
         if (ip_type == IPPROTO_UDP) {
             if (parse_udp_hdr(&parse_pos, data_end, &udp_hdr) < 0) {
                 action = XDP_DROP;
                 goto out;
+            }
+            else{
+                bpf_printk("after parsing udp");
+                dport = bpf_ntohs(udp_hdr->dest);
+                action = token_policer(&dport);
             }
 	    } 
         else if (ip_type == IPPROTO_TCP) {
@@ -239,12 +298,18 @@ int  xdp_pass_func(struct xdp_md *ctx)
                 action = XDP_DROP;
                 goto out;
             }
+            else{
+                bpf_printk("after parsing tcp");
+                dport = bpf_ntohs(tcp_hdr->dest);
+                action = token_policer(&dport);
+            }
 	    }
         else if (ip_type == IPPROTO_ICMP) {
             if (parse_icmp_hdr(&parse_pos, data_end, &icmp_hdr) < 0) {
                 action = XDP_DROP;
                 goto out;
             }
+            bpf_printk("after parsing icmp");
         } 
         else {
             action = XDP_DROP;
@@ -259,10 +324,19 @@ int  xdp_pass_func(struct xdp_md *ctx)
             goto out;
         }
 
+        bpf_printk("after parsing ip6");
+
         if (ip_type == IPPROTO_UDP) {
             if (parse_udp_hdr(&parse_pos, data_end, &udp_hdr) < 0) {
                 action = XDP_DROP;
                 goto out;
+            }
+            else{
+                bpf_printk("after parsing udp");
+                dport = bpf_ntohs(udp_hdr->dest);
+                // __u64 host_port = bpf_ntohs(udp_hdr->dest);
+                bpf_printk("port no udp: %d\n", dport);
+                action = token_policer(&dport);
             }
 	    } 
         else if (ip_type == IPPROTO_TCP) {
@@ -270,12 +344,18 @@ int  xdp_pass_func(struct xdp_md *ctx)
                 action = XDP_DROP;
                 goto out;
             }
+            else{
+                bpf_printk("after parsing tcp");
+                dport = bpf_ntohs(tcp_hdr->dest);
+                action = token_policer(&dport);
+            }
 	    }
         else if (ip_type == IPPROTO_ICMPV6) {
             if (parse_icmp6_hdr(&parse_pos, data_end, &icmp6_hdr) < 0) {
                 action = XDP_DROP;
                 goto out;
             }
+             bpf_printk("after parsing icmp6");
         } 
         else {
             action = XDP_DROP;
@@ -286,6 +366,11 @@ int  xdp_pass_func(struct xdp_md *ctx)
         action = XDP_DROP;
 		goto out;
 	}
+
+    bpf_printk("before returning action: %d", action);
+    return action;
+
+    bpf_printk("after returning action");
 
 out:
     return action;
